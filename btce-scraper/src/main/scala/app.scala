@@ -3,46 +3,38 @@ package cryptovent.btce.scraper
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
-import org.joda.time.DateTime
-import org.joda.time.format.DateTimeFormat
-
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
-
 import scala.collection.JavaConverters._
-import scala.util.{ Try, Success, Failure }
+import scala.slick.driver.{ JdbcProfile, SQLiteDriver }
+import scala.slick.jdbc.meta.MTable
 import scala.util.control.NonFatal
-import org.apache.log4j.{Level, LogManager}
+import scalaz._
 
 case class ChatMessage(id: Long, time: Long, name: String, text: String)
 
-class SiteApi {
-  private final val logger = LoggerFactory.getLogger(classOf[SiteApi])
-  private final val SiteUrl = "http://trollboxarchive.com"
-  private final val IndexUrl = SiteUrl + "/index.php"
-  private final val QuoteUrl = SiteUrl + "/quote24.php"
-  private final val TimeFormatter = DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss").withZoneUTC()
+object SiteApi {
+  def pageUrl(number: Long): String = "http://trollboxarchive.com/page/" + number.toString
 
-  def page(index: Long): Try[Document] = {
-    val connection = Try(Jsoup.connect(IndexUrl))
-    connection.map { _.data("page", index.toString) }
-    connection.map { _.execute().parse() }
-  }
+  def page(index: Long): \/[Throwable, Document] =
+    try \/-(Jsoup.connect(pageUrl(index)).execute().parse()) catch {
+      case NonFatal(e) => -\/(e)
+    }
 
   def scrape(doc: Document): List[ChatMessage] =
-    for (
-      row <- doc.select(".chat-record-row").iterator.asScala.toList;
-      id = row.attr("id").toLong;
-      name = row.child(0).text();
-      timeRaw = row.child(2).child(0).attr("data-time");
-      time = DateTime.parse(timeRaw, TimeFormatter).getMillis;
-      text = row.child(3).text()
-    ) yield ChatMessage(id, time, name, text)
+    for {
+      row <- doc.select(".chat-record-message-area").iterator.asScala.toList
+      name_link = row.child(0)
+      message_span = row.child(1)
+      date_span = row.child(2).select(".chat-record-date").iterator.asScala.toList.head
+
+      id = message_span.attr("data-chatid").toLong
+      name = name_link.text().split(":")(0)
+      time = date_span.attr("data-time").toLong / 1000
+      text = message_span.text()
+    } yield ChatMessage(id, time, name, text)
 }
 
-object App {
-  import scala.slick.driver.SQLiteDriver.simple._
-  import scala.slick.jdbc.meta.MTable
+class Scheme(val driver: JdbcProfile) {
+  import driver.simple._
 
   class Messages(tag: Tag) extends Table[ChatMessage](tag, "messages") {
     def id = column[Long]("id", O.PrimaryKey) // This is the primary key column
@@ -55,15 +47,30 @@ object App {
   }
   val messages = TableQuery[Messages]
 
-  def retry[T](times: Int)(func: => Try[T]): Try[T] = {
+  def create(implicit session: Session): Unit = messages.ddl.create
+  def tableExists(implicit session: Session): Boolean = MTable.getTables("messages").list.isEmpty
+  def insert(message: ChatMessage)(implicit session: Session): Boolean = {
+    if (!messages.filter(_.id === message.id).exists.run) {
+      messages += message
+      true
+    } else false
+  }
+}
+
+case class Config(startPage: Long = -1, db: String = "")
+
+object App {
+  import scala.slick.jdbc.JdbcBackend.{ Database, Session }
+
+  def retry[U, V](times: Int)(func: => U \/ V): U \/ V = {
     require(times > 0)
 
-    var result: Try[T] = null
+    var result: U \/ V = null
     var count = 0
 
     while (count < times) {
       result = func
-      if (result.isSuccess) {
+      if (result.isRight) {
         count = times - 1
       }
       count += 1
@@ -73,24 +80,18 @@ object App {
   }
 
   def main(args: Array[String]): Unit = {
-    val api = new SiteApi
+    val scheme = new Scheme(SQLiteDriver)
 
     Database.forURL("jdbc:sqlite:messages.db", driver = "org.sqlite.JDBC") withSession { implicit session =>
-      if (MTable.getTables("messages").list.isEmpty) {
-        messages.ddl.create
-      }
+      if (!scheme.tableExists) scheme.create
 
       for (i <- 0L until 30000L) {
         var count = 0
-        retry(5) { api.page(i) } match {
-          case Success(doc) =>
-            for (message <- api.scrape(doc)) {
-              if (messages.filter(_.id === message.id).length.run == 0) {
-                messages += message
-                count += 1
-              }
-            }
-          case Failure(e) =>
+        retry(5) { SiteApi.page(i) } match {
+          case \/-(doc) => SiteApi.scrape(doc).foreach { m =>
+            if (scheme.insert(m)) count += 1
+          }
+          case -\/(e) =>
             println(e.getMessage)
             e.printStackTrace()
         }
