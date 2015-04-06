@@ -3,11 +3,13 @@ package cryptovent.btce.scraper
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
+import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.slick.driver.{ JdbcProfile, SQLiteDriver }
 import scala.slick.jdbc.meta.MTable
 import scala.util.control.NonFatal
 import scalaz._
+import scalaz.effect._
 
 case class ChatMessage(id: Long, time: Long, name: String, text: String)
 
@@ -15,7 +17,9 @@ object SiteApi {
   def pageUrl(number: Long): String = "http://trollboxarchive.com/page/" + number.toString
 
   def page(index: Long): \/[Throwable, Document] =
-    try \/-(Jsoup.connect(pageUrl(index)).execute().parse()) catch {
+    try \/-(Jsoup.connect(pageUrl(index))
+                 .execute()
+                 .parse()) catch {
       case NonFatal(e) => -\/(e)
     }
 
@@ -48,12 +52,15 @@ class Scheme(val driver: JdbcProfile) {
   val messages = TableQuery[Messages]
 
   def create(implicit session: Session): Unit = messages.ddl.create
-  def tableExists(implicit session: Session): Boolean = MTable.getTables("messages").list.isEmpty
-  def insert(message: ChatMessage)(implicit session: Session): Boolean = {
-    if (!messages.filter(_.id === message.id).exists.run) {
-      messages += message
-      true
-    } else false
+  def tableExists(implicit session: Session): Boolean = !MTable.getTables("messages").list.isEmpty
+
+  def filterNew(list: List[ChatMessage])(implicit session: Session): List[ChatMessage] = for {
+    message <- list
+    if !messages.filter(_.id === message.id).exists.run
+  } yield message
+
+  def insertAll(list: List[ChatMessage])(implicit session: Session): Unit = {
+    messages ++= list
   }
 }
 
@@ -65,18 +72,12 @@ object App {
   def retry[U, V](times: Int)(func: => U \/ V): U \/ V = {
     require(times > 0)
 
-    var result: U \/ V = null
-    var count = 0
-
-    while (count < times) {
-      result = func
-      if (result.isRight) {
-        count = times - 1
-      }
-      count += 1
+    @tailrec def retry0(times: Int, last: U \/ V): U \/ V = last match {
+      case -\/(e) if times > 0 => retry0(times - 1, func)
+      case x => x
     }
 
-    result
+    retry0(times - 1, func)
   }
 
   def main(args: Array[String]): Unit = {
@@ -85,17 +86,19 @@ object App {
     Database.forURL("jdbc:sqlite:messages.db", driver = "org.sqlite.JDBC") withSession { implicit session =>
       if (!scheme.tableExists) scheme.create
 
-      for (i <- 0L until 30000L) {
-        var count = 0
+      for (i <- args(0).toLong until 50000L) {
+        println(s"Downloading page $i")
         retry(5) { SiteApi.page(i) } match {
-          case \/-(doc) => SiteApi.scrape(doc).foreach { m =>
-            if (scheme.insert(m)) count += 1
-          }
+          case \/-(doc) =>
+            val messages = SiteApi.scrape(doc)
+            val newMessages = scheme.filterNew(messages)
+            println(s"Found ${newMessages.size} new messages on page $i.")
+            scheme.insertAll(newMessages)
           case -\/(e) =>
             println(e.getMessage)
             e.printStackTrace()
         }
-        println(s"Found $count new messages on page $i.")
+
       }
     }
   }
