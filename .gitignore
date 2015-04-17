@@ -59,4 +59,4 @@ target/
 # Other files
 .idea/
 .ipynb_checkpoints/
-/data/
+/data/heavy/
