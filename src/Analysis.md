@@ -4,11 +4,17 @@
 >>> import numpy as np
 >>> import sqlite3
 >>> import re
+>>> import math
+>>> import nltk
+>>> import twitter
+>>> import ux
+>>> import fx
+>>> from itertools import islice
 >>> from collections import Counter
 ```
 
 ```python
->>> conn = sqlite3.connect('../data/text.btce.db')
+>>> conn = sqlite3.connect('../data/heavy/text.btce.db')
 >>> cur = conn.cursor()
 ```
 
@@ -44,28 +50,45 @@
 ```
 
 ```python
->>> df = Counter()
->>> tf = Counter()
->>> for row in cur.execute('select text from messages'):
-...     sentence = stupid_tokenize(row[0])
-...     words = set(sentence)
-...     for word in sentence:
-...         tf[word] += 1
-...     for word in words:
-...         df[word] += 1
+>>> def tfdf(documents):
+...     df = Counter()
+...     tf = Counter()
 ...
->>> for word in STOPLIST:
-...     del tf[word]
-...     del df[word]
+...     for document in documents:
+...         words = set(document)
+...         for word in document:
+...             tf[word] += 1
+...         for word in words:
+...             df[word] += 1
 ...
->>> tfidf = []
+...     return tf, df
+...
+>>> def tfidf(tf, df):
+...     return tf / (1 + math.log(1 + df))
+```
+
+```python
+>>> tf, df = tfdf(nltk.word_tokenize(row[0].lower())
+...               for row in cur.execute('select text from messages'))
+...
+>>> result = []
 >>> for word in tf:
-...     tfidf.append((word, tf[word] / (1 + math.log(1 + df[word]))))
->>> tfidf.sort(key=lambda t: -t[1])
+...     x, y = tf[word], df[word]
+...     result.append((word, x, y, tfidf(x, y)))
+>>> result.sort(key=lambda t: -t[-1])
+```
+
+```python
+>>> with open('../data/btce.all.txt', 'w') as f:
+...     for w in result:
+...         f.write(('\t'.join(unicode(x) for x in w) + '\n').encode('utf-8'))
+```
+
+```python
+>>> lines = (line for line in ux.line_reader('/media/alex/Data/data/twitter_stream_ner_temp_event_5pc.gz'))
+>>> tweets = (twitter.parse_tweet(line, True) for line in lines)
 ...
->>> top100 = list(map(lambda t:t[0], tfidf[:100]))
-...
->>> top100[:10]
+>>> tf, df = tfdf(tweet.words for tweet in tweets)
 ```
 
 ```python
